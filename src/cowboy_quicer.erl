@@ -23,6 +23,7 @@
 -export([shutdown/2]).
 
 %% Streams.
+-export([start_bidi_stream/2]).
 -export([start_unidi_stream/2]).
 -export([send/3]).
 -export([send/4]).
@@ -44,6 +45,9 @@ peercert(_) -> no_quicer().
 
 -spec shutdown(_, _) -> no_return().
 shutdown(_, _) -> no_quicer().
+
+-spec start_bidi_stream(_, _) -> no_return().
+start_bidi_stream(_, _) -> no_quicer().
 
 -spec start_unidi_stream(_, _) -> no_return().
 start_unidi_stream(_, _) -> no_quicer().
@@ -109,16 +113,26 @@ shutdown(Conn, ErrorCode) ->
 
 %% Streams.
 
+-spec start_bidi_stream(quicer_connection_handle(), iodata())
+	-> {ok, cow_http3:stream_id()}
+	| {error, any()}.
+
+start_bidi_stream(Conn, InitialData) ->
+	start_stream(Conn, InitialData, ?QUIC_STREAM_OPEN_FLAG_NONE).
+
 -spec start_unidi_stream(quicer_connection_handle(), iodata())
 	-> {ok, cow_http3:stream_id()}
 	| {error, any()}.
 
-start_unidi_stream(Conn, HeaderData) ->
+start_unidi_stream(Conn, InitialData) ->
+	start_stream(Conn, InitialData, ?QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL).
+
+start_stream(Conn, InitialData, OpenFlag) ->
 	case quicer:start_stream(Conn, #{
 			active => true,
-			open_flag => ?QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL}) of
+			open_flag => OpenFlag}) of
 		{ok, StreamRef} ->
-			case quicer:send(StreamRef, HeaderData) of
+			case quicer:send(StreamRef, InitialData) of
 				{ok, _} ->
 					{ok, StreamID} = quicer:get_stream_id(StreamRef),
 					put({quicer_stream, StreamID}, StreamRef),

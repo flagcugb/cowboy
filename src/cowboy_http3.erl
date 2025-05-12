@@ -32,10 +32,10 @@
 	enable_connect_protocol => boolean(),
 	env => cowboy_middleware:env(),
 	logger => module(),
-    max_decode_blocked_streams => 0..16#3fffffffffffffff,
-    max_decode_table_size => 0..16#3fffffffffffffff,
-    max_encode_blocked_streams => 0..16#3fffffffffffffff,
-    max_encode_table_size => 0..16#3fffffffffffffff,
+	max_decode_blocked_streams => 0..16#3fffffffffffffff,
+	max_decode_table_size => 0..16#3fffffffffffffff,
+	max_encode_blocked_streams => 0..16#3fffffffffffffff,
+	max_encode_table_size => 0..16#3fffffffffffffff,
 	max_ignored_frame_size_received => non_neg_integer() | infinity,
 	metrics_callback => cowboy_metrics_h:metrics_callback(),
 	metrics_req_filter => fun((cowboy_req:req()) -> map()),
@@ -51,12 +51,43 @@
 }.
 -export_type([opts/0]).
 
+%% @todo We have the WT CONNECT stream, using the capsule protocol
+%%       and the WT children stream whose events are redirected directly to cowboy_webtransport.
+%%       We probably need two new statuses to accomodate for that.
+%%       We might need a concept of WT session somewhere, perhaps as part of the status.
+%%       The session can be identified by the StreamID of the CONNECT stream.
+%% Maybe {webtransport, SessionID, unidi|bidi}
+%% Basically when we receive data for a webtransport SessionID we need to send it
+%% to that SessionID's request process. Hmm... but how? The process was started
+%% by cowboy_stream_h not by the protocol, so we need a way to hand off that
+%% process. We can get the child by asking cowboy_children but...
+%% We can give the pid via the switch_protocol in the ModState I guess.
+%% And then that protocol would just send to the pid? But where do we store the pid then?
+%% We probably need a webtransport_sessions field in the state
+%%   #{SessionID => pid()}
+%% Then when we get a new stream we can inform,
+%% when a stream gets data/closes we can inform,
+%% when a datagram we can inform (contains quarterstreamid).
+%% @todo
+
+%% HTTP/3 or WebTransport stream.
+%%
+%% WebTransport sessions involve one bidirectional CONNECT stream
+%% that must stay open (and can be used for signaling using the
+%% Capsule Protocol) and an application-defined number of
+%% unidirectional and bidirectional streams, as well as datagrams.
+%%
+%% WebTransport sessions run in the CONNECT request process and
+%% all events related to the session is sent there as a message.
+%% The pid of the process is kept in the state.
 -record(stream, {
 	id :: cow_http3:stream_id(),
 
 	%% Whether the stream is currently in a special state.
 	status :: header | {unidi, control | encoder | decoder}
-		| normal | {data | ignore, non_neg_integer()} | stopping,
+		| normal | {data | ignore, non_neg_integer()} | stopping
+		%% @todo Is unidi | bidi useful to keep?
+		| webtransport_session | {webtransport_stream, cow_http3:stream_id(), unidi | bidi},
 
 	%% Stream buffer.
 	buffer = <<>> :: binary(),
@@ -152,6 +183,9 @@ loop(State0=#state{opts=Opts, children=Children}) ->
 		%% Messages pertaining to a stream.
 		{{Pid, StreamID}, Msg} when Pid =:= self() ->
 			loop(info(State0, StreamID, Msg));
+		%% WebTransport commands.
+		{'$webtransport_commands', SessionID, Commands} ->
+			loop(webtransport_commands(State0, SessionID, Commands));
 		%% Exit signal from children.
 		Msg = {'EXIT', Pid, _} ->
 			loop(down(State0, Pid, Msg));
@@ -216,6 +250,14 @@ parse1(State=#state{http3_machine=HTTP3Machine0},
 		{error, Error={connection_error, _, _}, HTTP3Machine} ->
 			terminate(State#state{http3_machine=HTTP3Machine}, Error)
 	end;
+%% @todo WT status
+parse1(State, Stream=#stream{status=webtransport_session}, Data, IsFin) ->
+	%% @todo HTTP Capsules.
+	error({todo, State, Stream, Data, IsFin});
+parse1(State, #stream{id=StreamID, status={webtransport_stream, SessionID, _}}, Data, IsFin) ->
+	webtransport_event(State, SessionID, {stream_data, StreamID, IsFin, Data}),
+	%% No need to store the stream again, WT streams don't get changed here.
+	loop(State);
 parse1(State, Stream=#stream{status={data, Len}, id=StreamID}, Data, IsFin) ->
 	DataLen = byte_size(Data),
 	if
@@ -245,7 +287,13 @@ parse1(State=#state{opts=Opts}, Stream=#stream{id=StreamID}, Data, IsFin) ->
 	case cow_http3:parse(Data) of
 		{ok, Frame, Rest} ->
 			FrameIsFin = is_fin(IsFin, Rest),
+			%% @todo If we become a webtransport stream we don't want
+			%%       to continue parsing as HTTP/3. That's OK we will
+			%%       branch off based on stream status. Nothing to do here.
 			parse(frame(State, Stream, Frame, FrameIsFin), StreamID, Rest, IsFin);
+		%% The WebTransport stream header is not a real frame.
+		{webtransport_stream_header, SessionID, Rest} ->
+			become_webtransport_stream(State, Stream, bidi, SessionID, Rest, IsFin);
 		{more, Frame = {data, _}, Len} ->
 			%% We're at the end of the data so FrameIsFin is equivalent to IsFin.
 			case IsFin of
@@ -317,13 +365,24 @@ parse_unidirectional_stream_header(State0=#state{http3_machine=HTTP3Machine0},
 				{error, Error={connection_error, _, _}, HTTP3Machine} ->
 					terminate(State0#state{http3_machine=HTTP3Machine}, Error)
 			end;
+		%% @todo Perhaps do this in cow_http3_machine directly.
 		{ok, push, _} ->
 			terminate(State0, {connection_error, h3_stream_creation_error,
 				'Only servers can push. (RFC9114 6.2.2)'});
+		{ok, {webtransport, SessionID}, Rest} ->
+			become_webtransport_stream(State0, Stream0, unidi, SessionID, Rest, IsFin);
 		%% Unknown stream types must be ignored. We choose to abort the
 		%% stream instead of reading and discarding the incoming data.
 		{undefined, _} ->
-			loop(stream_abort_receive(State0, Stream0, h3_stream_creation_error))
+			loop(stream_abort_receive(State0, Stream0, h3_stream_creation_error));
+		%% Very unlikely to happen but WebTransport headers may be fragmented
+		%% as they are more than one byte. The fin flag in this case is an error,
+		%% but because it happens in WebTransport application data (the Session ID)
+		%% we only reset the impacted stream and not the entire connection.
+		more when IsFin =:= fin ->
+			loop(stream_abort_receive(State0, Stream0, h3_stream_creation_error));
+		more ->
+			loop(stream_store(State0, Stream0#stream{buffer=Data}))
 	end.
 
 frame(State=#state{http3_machine=HTTP3Machine0},
@@ -450,6 +509,10 @@ headers_to_map([{Name, Value}|Tail], Acc0) ->
 	headers_to_map(Tail, Acc).
 
 headers_frame(State=#state{opts=Opts}, Stream=#stream{id=StreamID}, Req) ->
+
+%% @todo For webtransport CONNECT requests we must have extra checks on settings.
+%% @todo We may also need to defer them if we didn't get settings.
+
 	try cowboy_stream:init(StreamID, Req, Opts) of
 		{Commands, StreamState} ->
 			commands(State, Stream#stream{state=StreamState}, Commands)
@@ -653,10 +716,29 @@ commands(State, Stream, [Error = {internal_error, _, _}|_Tail]) ->
 	reset_stream(State, Stream, Error);
 %% Use a different protocol within the stream (CONNECT :protocol).
 %% @todo Make sure we error out when the feature is disabled.
+commands(State0=#state{http3_machine=HTTP3Machine0}, Stream0=#stream{id=StreamID},
+		[{switch_protocol, Headers, cowboy_webtransport, WTState=#{}}|Tail]) ->
+	State = info(stream_store(State0, Stream0), StreamID, {headers, 200, Headers}),
+	Stream1 = #stream{state=StreamState} = stream_get(State, StreamID),
+	%% The stream becomes a WT session at that point. It is the
+	%% parent stream of all streams in this WT session. The
+	%% cowboy_stream state is kept because it will be needed
+	%% to terminate the stream properly.
+	HTTP3Machine = cow_http3_machine:become_webtransport_session(StreamID, HTTP3Machine0),
+	Stream = Stream1#stream{
+		status=webtransport_session,
+		state={cowboy_webtransport, WTState#{stream_state => StreamState}}
+	},
+	%% @todo We must propagate the buffer to capsule handling if any.
+	commands(State#state{http3_machine=HTTP3Machine}, Stream, Tail);
 commands(State0, Stream0=#stream{id=StreamID},
 		[{switch_protocol, Headers, _Mod, _ModState}|Tail]) ->
 	State = info(stream_store(State0, Stream0), StreamID, {headers, 200, Headers}),
 	Stream = stream_get(State, StreamID),
+	%% @todo For webtransport we want to stop handling this as a normal stream.
+	%%       This becomes a stream that uses the capsule protocol
+	%%       https://www.rfc-editor.org/rfc/rfc9297#name-the-capsule-protocol
+	%%       and relates to a webtransport session (the request process).
 	commands(State, Stream, Tail);
 %% Set options dynamically.
 commands(State, Stream, [{set_options, _Opts}|Tail]) ->
@@ -757,6 +839,67 @@ send_instructions(State=#state{conn=Conn, local_encoder_id=EncoderID},
 	ok = maybe_socket_error(State,
 		cowboy_quicer:send(Conn, EncoderID, EncData)),
 	State.
+
+%% We mark the stream as being a WebTransport stream
+%% and then continue parsing the data as a WebTransport
+%% stream. This function is common for incoming unidi
+%% and bidi streams.
+become_webtransport_stream(State0=#state{http3_machine=HTTP3Machine0},
+		Stream0=#stream{id=StreamID}, StreamType, SessionID, Rest, IsFin) ->
+	case cow_http3_machine:become_webtransport_stream(StreamID, SessionID, HTTP3Machine0) of
+		{ok, HTTP3Machine} ->
+			State = State0#state{http3_machine=HTTP3Machine},
+			Stream = Stream0#stream{status={webtransport_stream, SessionID, StreamType}},
+			webtransport_event(State, SessionID, {stream_open, StreamID, StreamType}),
+			parse(stream_store(State, Stream), StreamID, Rest, IsFin)
+		%% @todo Error conditions.
+	end.
+
+webtransport_event(State, SessionID, Event) ->
+	#stream{
+		status=webtransport_session,
+		state={cowboy_webtransport, #{session_pid := SessionPid}}
+	} = stream_get(State, SessionID),
+	SessionPid ! {'$webtransport_event', Event},
+	ok.
+
+webtransport_commands(State, SessionID, Commands) ->
+	Session = #stream{status=webtransport_session} = stream_get(SessionID, State),
+	wt_commands(State, Session, Commands).
+
+wt_commands(State, _, []) ->
+	State;
+wt_commands(State=#state{conn=Conn}, Session=#stream{id=SessionID},
+		[{open_stream, OpenStreamRef, StreamType, InitialData}|Tail]) ->
+	%% Because opening the stream involves sending a short header
+	%% we necessarily write data. The InitialData variable allows
+	%% providing additional data to be sent in the same packet.
+	StartF = case StreamType of
+		bidi -> start_bidi_stream;
+		unidi -> start_unidi_stream
+	end,
+	Header = cow_http3:webtransport_stream_header(SessionID, StreamType),
+	case cowboy_quicer:StartF(Conn, [Header, InitialData]) of
+		{ok, StreamID} ->
+			%% @todo Pass Session directly?
+			webtransport_event(State, SessionID,
+				{opened_stream_id, OpenStreamRef, StreamID}),
+			%% @todo Save the WT stream in cow_http3_machine AND here.
+			wt_commands(State, Session, Tail)
+		%% @todo Handle errors.
+	end;
+wt_commands(State, Session, [{close_stream, StreamID, Code}|Tail]) ->
+	%% @todo Check that StreamID belongs to Session.
+	error({todo, State, Session, [{close_stream, StreamID, Code}|Tail]});
+wt_commands(State, Session, [{send, datagram, Data}|Tail]) ->
+	error({todo, State, Session, [{send, datagram, Data}|Tail]});
+wt_commands(State=#state{conn=Conn}, Session, [{send, StreamID, Data}|Tail]) ->
+	%% @todo Check that StreamID belongs to Session.
+	case cowboy_quicer:send(Conn, StreamID, Data, nofin) of
+		ok ->
+			wt_commands(State, Session, Tail)
+		%% @todo Handle errors.
+	end.
 
 reset_stream(State0=#state{conn=Conn, http3_machine=HTTP3Machine0},
 		Stream=#stream{id=StreamID}, Error) ->
