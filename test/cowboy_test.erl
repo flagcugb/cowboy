@@ -53,6 +53,7 @@ init_http3(Ref, ProtoOpts, Config) ->
 	},
 	{ok, Listener} = cowboy:start_quic(Ref, TransOpts, ProtoOpts),
 	{ok, {_, Port}} = quicer:sockname(Listener),
+	ct:pal("port ~p", [Port]),
 	%% @todo Keep listener information around in a better place.
 	persistent_term:put({cowboy_test_quic, Ref}, Listener),
 	[{ref, Ref}, {type, quic}, {protocol, http3}, {port, Port}, {opts, TransOpts}|Config].

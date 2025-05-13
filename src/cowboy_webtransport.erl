@@ -34,6 +34,7 @@
 -export_type([opts/0]).
 
 -record(state, {
+	id :: cow_http3:stream_id(),
 	parent :: pid(),
 	opts = #{} :: opts(),
 	handler :: module(),
@@ -72,7 +73,7 @@ upgrade(Req=#{version := 'HTTP/3', pid := Pid, streamid := StreamID}, Env, Handl
 		FilterFun -> FilterFun(Req)
 	end,
 	%% @todo add parent, ref, streamid here directly
-	State = #state{parent=Pid, opts=Opts, handler=Handler, req=FilteredReq},
+	State = #state{id=StreamID, parent=Pid, opts=Opts, handler=Handler, req=FilteredReq},
 
 	%% @todo Must check is_upgrade_request (rename, not an upgrade)
 	%% and also ensure that all the relevant settings are enabled (quic and h3)
@@ -179,8 +180,8 @@ handler_call_result(State0, HandlerState, Commands) ->
 
 commands([], State, []) ->
 	{ok, State};
-commands([], State=#state{parent=Pid}, Commands) ->
-	Pid ! {'$webtransport_commands', lists:reverse(Commands)},
+commands([], State=#state{id=SessionID, parent=Pid}, Commands) ->
+	Pid ! {'$webtransport_commands', SessionID, lists:reverse(Commands)},
 	{ok, State};
 %% {open_stream, OpenStreamRef, StreamType, InitialData}.
 commands([Command={open_stream, _, _, _}|Tail], State, Acc) ->

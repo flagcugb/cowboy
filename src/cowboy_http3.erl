@@ -716,9 +716,10 @@ commands(State, Stream, [Error = {internal_error, _, _}|_Tail]) ->
 	reset_stream(State, Stream, Error);
 %% Use a different protocol within the stream (CONNECT :protocol).
 %% @todo Make sure we error out when the feature is disabled.
-commands(State0=#state{http3_machine=HTTP3Machine0}, Stream0=#stream{id=StreamID},
+commands(State0, Stream0=#stream{id=StreamID},
 		[{switch_protocol, Headers, cowboy_webtransport, WTState=#{}}|Tail]) ->
 	State = info(stream_store(State0, Stream0), StreamID, {headers, 200, Headers}),
+	#state{http3_machine=HTTP3Machine0} = State,
 	Stream1 = #stream{state=StreamState} = stream_get(State, StreamID),
 	%% The stream becomes a WT session at that point. It is the
 	%% parent stream of all streams in this WT session. The
@@ -864,7 +865,7 @@ webtransport_event(State, SessionID, Event) ->
 	ok.
 
 webtransport_commands(State, SessionID, Commands) ->
-	Session = #stream{status=webtransport_session} = stream_get(SessionID, State),
+	Session = #stream{status=webtransport_session} = stream_get(State, SessionID),
 	wt_commands(State, Session, Commands).
 
 wt_commands(State, _, []) ->
