@@ -852,7 +852,11 @@ become_webtransport_stream(State0=#state{http3_machine=HTTP3Machine0},
 			State = State0#state{http3_machine=HTTP3Machine},
 			Stream = Stream0#stream{status={webtransport_stream, SessionID, StreamType}},
 			webtransport_event(State, SessionID, {stream_open, StreamID, StreamType}),
-			parse(stream_store(State, Stream), StreamID, Rest, IsFin)
+			%% We don't need to parse the remaining data if there isn't any.
+			case {Rest, IsFin} of
+				{<<>>, nofin} -> loop(stream_store(State, Stream));
+				_ -> parse(stream_store(State, Stream), StreamID, Rest, IsFin)
+			end
 		%% @todo Error conditions.
 	end.
 
@@ -897,6 +901,13 @@ wt_commands(State, Session, [{send, datagram, Data}|Tail]) ->
 wt_commands(State=#state{conn=Conn}, Session, [{send, StreamID, Data}|Tail]) ->
 	%% @todo Check that StreamID belongs to Session.
 	case cowboy_quicer:send(Conn, StreamID, Data, nofin) of
+		ok ->
+			wt_commands(State, Session, Tail)
+		%% @todo Handle errors.
+	end;
+wt_commands(State=#state{conn=Conn}, Session, [Cmd = {send, StreamID, IsFin, Data}|Tail]) ->
+	%% @todo Check that StreamID belongs to Session.
+	case cowboy_quicer:send(Conn, StreamID, Data, IsFin) of
 		ok ->
 			wt_commands(State, Session, Tail)
 		%% @todo Handle errors.

@@ -145,12 +145,12 @@ loop(State=#state{parent=Parent%, timeout_ref=TRef
 			cowboy_children:handle_supervisor_call(Call, From, [], ?MODULE),
 			before_loop(State, HandlerState);
 		Message ->
-			handler_call(State, HandlerState, websocket_info, Message)
+			handler_call(State, HandlerState, webtransport_info, Message)
 	end.
 
 handler_call(State=#state{handler=Handler}, HandlerState, Callback, Message) ->
 	try case Callback of
-		websocket_init -> Handler:websocket_init(HandlerState);
+		webtransport_init -> Handler:webtransport_init(HandlerState);
 		_ -> Handler:Callback(Message, HandlerState)
 	end of
 		{Commands, HandlerState2} when is_list(Commands) ->
@@ -189,8 +189,12 @@ commands([Command={open_stream, _, _, _}|Tail], State, Acc) ->
 %% {close_stream, StreamID, Code}.
 commands([Command={close_stream, _, _}|Tail], State, Acc) ->
 	commands(Tail, State, [Command|Acc]);
+%% @todo We must reject send to a remote unidi stream.
 %% {send, StreamID | datagram, Data}.
 commands([Command={send, _, _}|Tail], State, Acc) ->
+	commands(Tail, State, [Command|Acc]);
+%% {send, StreamID, IsFin, Data}.
+commands([Command={send, _, _, _}|Tail], State, Acc) ->
 	commands(Tail, State, [Command|Acc]).
 %% @todo send with IsFin
 %% @todo stop, {error, Reason} probably. What to do about sending when asked to stop?
@@ -210,6 +214,7 @@ terminate(State, HandlerState, Error) ->
 %%
 %% webtransport_init(HandlerState)
 %% webtransport_handle({opened_stream_id, OpenStreamRef, StreamID}, HandlerState)
+%% @todo opened_stream_error
 %% webtransport_handle({stream_open, StreamID, unidi | bidi}, HandlerState)
 %% webtransport_handle({stream_data, StreamID, IsFin, Data}, HandlerState)
 %% webtransport_handle({stream_reset_at, StreamID, Code, FinalSize}, HandlerState)
